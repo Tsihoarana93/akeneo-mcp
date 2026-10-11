@@ -1,0 +1,24 @@
+{
+    "name": "antonny/akeneo-mcp",
+    "description": "Laravel MCP server for the Akeneo PIM REST API.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": "^8.2",
+        "laravel/mcp": "^0.4.1|^0.5|^0.6|^0.7|^0.8|^0.9|^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Antonny\\AkeneoMcp\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Antonny\\AkeneoMcp\\AkeneoMcpServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
