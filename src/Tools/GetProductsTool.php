@@ -2,88 +2,134 @@
 
 namespace Antonny\AkeneoMcp\Tools;
 
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Http;
+use Antonny\AkeneoMcp\AkeneoClient;
+use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
 use Laravel\Mcp\Request;
 use Laravel\Mcp\Response;
+use Laravel\Mcp\ResponseFactory;
 use Laravel\Mcp\Server\Tool;
+use Laravel\Mcp\Server\Tools\Annotations\IsIdempotent;
+use Laravel\Mcp\Server\Tools\Annotations\IsOpenWorld;
+use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
+use RuntimeException;
 
+#[IsReadOnly]
+#[IsIdempotent]
+#[IsOpenWorld]
 class GetProductsTool extends Tool
 {
     protected string $description = <<<'MARKDOWN'
         Retrieve a paginated list of products from the Akeneo PIM.
-        Supports filtering by search term and pagination.
+        Filter by identifier, family or enabled status, and limit the returned attribute values
+        with `attributes` and `locale` to keep the response small.
+        The total product count is only returned for the first page.
     MARKDOWN;
 
-    public function handle(Request $request): Response
+    public function handle(Request $request, AkeneoClient $akeneo): Response|ResponseFactory
     {
-        $token = $this->getAccessToken();
-
-        $query = array_filter([
-            'limit'      => $request->get('limit', 10),
-            'page'       => $request->get('page', 1),
-            'with_count' => 'true',
+        $validated = $request->validate([
+            'search'     => 'nullable|string',
+            'family'     => 'nullable|string',
+            'enabled'    => 'nullable|boolean',
+            'attributes' => 'nullable|string',
+            'locale'     => 'nullable|string',
+            'limit'      => 'nullable|integer|min:1|max:100',
+            'page'       => 'nullable|integer|min:1',
         ]);
 
-        $search = $request->get('search');
-        if ($search) {
-            $query['search'] = json_encode([
-                'label' => [['operator' => 'CONTAINS', 'value' => $search, 'locale' => 'en_US']],
-            ]);
+        $limit = (int) ($validated['limit'] ?? 10);
+        $page = (int) ($validated['page'] ?? 1);
+
+        $query = [
+            'limit'      => $limit,
+            'page'       => $page,
+            'with_count' => $page === 1 ? 'true' : 'false',
+        ];
+
+        $search = $this->buildSearch($validated);
+
+        if ($search !== []) {
+            $query['search'] = json_encode($search);
         }
 
-        $response = Http::withToken($token)
-            ->get(config('akeneo-mcp.base_url') . '/api/rest/v1/products', $query);
-
-        if ($response->failed()) {
-            return Response::text('Akeneo API error: ' . $response->status() . ' ' . $response->body());
+        if (! empty($validated['attributes'])) {
+            $query['attributes'] = $validated['attributes'];
         }
 
-        $data = $response->json();
-        $items = collect($data['_embedded']['items'] ?? [])
-            ->map(fn($p) => [
-                'identifier' => $p['identifier'],
-                'enabled'    => $p['enabled'],
-                'family'     => $p['family'],
-                'categories' => $p['categories'],
-                'values'     => $p['values'],
-            ]);
+        if (! empty($validated['locale'])) {
+            $query['locales'] = $validated['locale'];
+        }
 
-        return Response::text(json_encode([
+        try {
+            $data = $akeneo->request()
+                ->get($akeneo->url('/api/rest/v1/products'), $query)
+                ->throw()
+                ->json();
+        } catch (RequestException $exception) {
+            return Response::error('Akeneo API error: ' . $exception->response->status() . ' ' . $exception->response->body());
+        } catch (ConnectionException|RuntimeException $exception) {
+            return Response::error('Akeneo API error: ' . $exception->getMessage());
+        }
+
+        $products = collect($data['_embedded']['items'] ?? [])
+            ->map(fn (array $product): array => [
+                'identifier' => $product['identifier'],
+                'enabled'    => $product['enabled'],
+                'family'     => $product['family'],
+                'categories' => $product['categories'],
+                'values'     => $product['values'],
+            ])
+            ->values()
+            ->all();
+
+        return Response::structured([
             'total'    => $data['items_count'] ?? null,
-            'page'     => $request->get('page', 1),
-            'limit'    => $request->get('limit', 10),
-            'products' => $items,
-        ], JSON_PRETTY_PRINT));
+            'page'     => $page,
+            'limit'    => $limit,
+            'products' => $products,
+        ]);
     }
 
-    public function outputSchema($schema): array
-    {
-        return [];
-    }
-
-    public function schema($schema): array
+    /**
+     * @return array<string, mixed>
+     */
+    public function schema(JsonSchema $schema): array
     {
         return [
-            'search' => $schema->string()->description('Filter products by label (case-insensitive contains match)'),
-            'limit'  => $schema->integer()->description('Number of products per page (default: 10, max: 100)'),
-            'page'   => $schema->integer()->description('Page number, starting at 1 (default: 1)'),
+            'search'     => $schema->string()->description('Only products whose identifier contains this text'),
+            'family'     => $schema->string()->description('Only products of this family code'),
+            'enabled'    => $schema->boolean()->description('Only enabled (true) or disabled (false) products'),
+            'attributes' => $schema->string()->description('Comma-separated attribute codes to include in values, e.g. "name,description"'),
+            'locale'     => $schema->string()->description('Only return values for this locale, e.g. "en_US"'),
+            'limit'      => $schema->integer()->min(1)->max(100)->default(10)->description('Number of products per page'),
+            'page'       => $schema->integer()->min(1)->default(1)->description('Page number, starting at 1'),
         ];
     }
 
-    private function getAccessToken(): string
+    /**
+     * Build Akeneo's `search` filter from the given arguments.
+     *
+     * @param  array<string, mixed>  $validated
+     * @return array<string, list<array{operator: string, value: mixed}>>
+     */
+    private function buildSearch(array $validated): array
     {
-        return Cache::remember('akeneo_access_token', 3500, function () {
-            $response = Http::withBasicAuth(
-                config('akeneo-mcp.client_id'),
-                config('akeneo-mcp.client_secret')
-            )->post(config('akeneo-mcp.base_url') . '/api/oauth/v1/token', [
-                'grant_type' => 'password',
-                'username'   => config('akeneo-mcp.username'),
-                'password'   => config('akeneo-mcp.password'),
-            ]);
+        $search = [];
 
-            return $response->json('access_token');
-        });
+        if (! empty($validated['search'])) {
+            $search['identifier'] = [['operator' => 'CONTAINS', 'value' => $validated['search']]];
+        }
+
+        if (! empty($validated['family'])) {
+            $search['family'] = [['operator' => 'IN', 'value' => [$validated['family']]]];
+        }
+
+        if (isset($validated['enabled'])) {
+            $search['enabled'] = [['operator' => '=', 'value' => (bool) $validated['enabled']]];
+        }
+
+        return $search;
     }
 }
